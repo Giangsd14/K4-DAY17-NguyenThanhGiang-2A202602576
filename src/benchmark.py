@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,72 +22,193 @@ class BenchmarkRow:
 
 
 def load_conversations(path: Path) -> list[dict[str, Any]]:
-    """Student TODO: read JSON conversations from disk."""
+    """Read JSON conversations from disk."""
 
-    raise NotImplementedError
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def recall_points(answer: str, expected: list[str]) -> float:
-    """Student TODO: return 0 / 0.5 / 1 depending on how many expected facts appear."""
+    """Return 0.0 / 0.5 / 1.0 depending on how many expected facts appear in the answer."""
 
-    raise NotImplementedError
+    if not expected:
+        return 1.0
+    ans_low = (answer or "").lower()
+    hits = sum(1 for item in expected if item.lower() in ans_low)
+    if hits == 0:
+        return 0.0
+    if hits == len(expected):
+        return 1.0
+    return 0.5
 
 
 def heuristic_quality(answer: str, expected: list[str]) -> float:
-    """Student TODO: add a lightweight quality score for offline mode."""
+    """Compute a deterministic quality score in [0.0, 1.0] for offline mode."""
 
-    raise NotImplementedError
+    cleaned = (answer or "").strip()
+    if not cleaned:
+        return 0.0
+
+    recall = recall_points(cleaned, expected)
+    structure_bonus = 0.10 if ("- " in cleaned or "\n" in cleaned) else 0.03
+    concise_bonus = 0.08 if 20 <= len(cleaned) <= 500 else 0.02
+
+    if recall == 0.0:
+        return round(0.15 + concise_bonus, 2)
+
+    score = 0.78 * recall + structure_bonus + concise_bonus
+    return round(min(1.0, score), 2)
 
 
-def run_agent_benchmark(agent_name: str, agent, conversations: list[dict[str, Any]], config) -> BenchmarkRow:
-    """Student TODO: evaluate one agent over many conversations.
+def run_agent_benchmark(
+    agent_name: str,
+    agent: Any,
+    conversations: list[dict[str, Any]],
+    config: Any,
+) -> BenchmarkRow:
+    """Evaluate one agent over a list of conversations and cross-session recall questions."""
 
-    Pseudocode:
-    1. Feed all turns to the agent.
-    2. Track `agent tokens only`.
-    3. Track `prompt tokens processed`.
-    4. Ask recall questions in a fresh thread.
-    5. Compute average recall and quality.
-    6. Record memory file growth and compaction count.
-    """
+    users = {str(conv.get("user_id", "default")) for conv in conversations}
+    if hasattr(agent, "profile_store"):
+        for uid in users:
+            profile_path = agent.profile_store.path_for(uid)
+            if profile_path.exists():
+                profile_path.unlink()
+            agent.profile_store._metadata.pop(uid, None)
+            agent.profile_store._turn_counter.pop(uid, None)
 
-    raise NotImplementedError
+    initial_sizes = {
+        uid: (agent.memory_file_size(uid) if hasattr(agent, "memory_file_size") else 0)
+        for uid in users
+    }
+
+    all_threads: list[str] = []
+    recall_scores: list[float] = []
+    quality_scores: list[float] = []
+
+    for conv in conversations:
+        thread_id = str(conv["id"])
+        user_id = str(conv["user_id"])
+        all_threads.append(thread_id)
+
+        for turn in conv.get("turns", []):
+            agent.reply(user_id, thread_id, str(turn))
+
+        for idx, rq in enumerate(conv.get("recall_questions", [])):
+            recall_thread_id = f"{thread_id}-recall-{idx}"
+            all_threads.append(recall_thread_id)
+            question = str(rq["question"])
+            expected = [str(x) for x in rq.get("expected_contains", [])]
+
+            result = agent.reply(user_id, recall_thread_id, question)
+            answer = str(result.get("response", ""))
+
+            recall_scores.append(recall_points(answer, expected))
+            quality_scores.append(heuristic_quality(answer, expected))
+
+    total_agent_tokens = sum(agent.token_usage(tid) for tid in all_threads)
+    total_prompt_tokens = sum(agent.prompt_token_usage(tid) for tid in all_threads)
+    total_compactions = sum(agent.compaction_count(tid) for tid in all_threads)
+
+    avg_recall = round(sum(recall_scores) / len(recall_scores), 2) if recall_scores else 0.0
+    avg_quality = round(sum(quality_scores) / len(quality_scores), 2) if quality_scores else 0.0
+
+    final_sizes = {
+        uid: (agent.memory_file_size(uid) if hasattr(agent, "memory_file_size") else 0)
+        for uid in users
+    }
+    memory_growth = sum(max(0, final_sizes[u] - initial_sizes[u]) for u in users)
+
+    return BenchmarkRow(
+        agent_name=agent_name,
+        agent_tokens_only=total_agent_tokens,
+        prompt_tokens_processed=total_prompt_tokens,
+        recall_score=avg_recall,
+        response_quality=avg_quality,
+        memory_growth_bytes=memory_growth,
+        compactions=total_compactions,
+    )
 
 
 def format_rows(rows: list[BenchmarkRow]) -> str:
-    """Student TODO: print a markdown table or tabulated output."""
+    """Format benchmark rows as a Markdown comparison table."""
 
-    raise NotImplementedError
+    headers = [
+        "Agent",
+        "Agent tokens only",
+        "Prompt tokens processed",
+        "Cross-session recall",
+        "Response quality",
+        "Memory growth (bytes)",
+        "Compactions",
+    ]
+    table_data = [
+        [
+            r.agent_name,
+            r.agent_tokens_only,
+            r.prompt_tokens_processed,
+            f"{r.recall_score:.2f}",
+            f"{r.response_quality:.2f}",
+            r.memory_growth_bytes,
+            r.compactions,
+        ]
+        for r in rows
+    ]
+
+    try:
+        from tabulate import tabulate
+
+        return str(tabulate(table_data, headers=headers, tablefmt="github"))
+    except ImportError:
+        widths = [
+            max(len(str(headers[i])), *(len(str(row[i])) for row in table_data))
+            for i in range(len(headers))
+        ]
+        header_line = (
+            "| "
+            + " | ".join(str(headers[i]).ljust(widths[i]) for i in range(len(headers)))
+            + " |"
+        )
+        sep_line = (
+            "| " + " | ".join("-" * widths[i] for i in range(len(headers))) + " |"
+        )
+        body_lines = [
+            "| "
+            + " | ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers)))
+            + " |"
+            for row in table_data
+        ]
+        return "\n".join([header_line, sep_line, *body_lines])
 
 
 def main() -> None:
-    """Student TODO: run both benchmark suites.
-
-    Required benchmark sections:
-    - Standard benchmark from `data/conversations.json`
-    - Long-context stress benchmark from `data/advanced_long_context.json`
-
-    Compare:
-    - Baseline
-    - Advanced
-
-    Keep the same output columns as the solved lab:
-    - Agent tokens only
-    - Prompt tokens processed
-    - Cross-session recall
-    - Response quality
-    - Memory growth (bytes)
-    - Compactions
-    """
+    """Run both Standard Benchmark and Long-Context Stress Benchmark."""
 
     config = load_config(Path(__file__).resolve().parent.parent)
 
-    # TODO:
-    # - load both datasets from root/data
-    # - initialize baseline and advanced agents
-    # - run benchmarks
-    # - print comparison tables
-    raise NotImplementedError
+    standard_convs = load_conversations(config.data_dir / "conversations.json")
+    stress_convs = load_conversations(config.data_dir / "advanced_long_context.json")
+
+    baseline_standard = BaselineAgent(config=config, force_offline=True)
+    advanced_standard = AdvancedAgent(config=config, force_offline=True)
+
+    standard_rows = [
+        run_agent_benchmark("Baseline", baseline_standard, standard_convs, config),
+        run_agent_benchmark("Advanced", advanced_standard, standard_convs, config),
+    ]
+
+    baseline_stress = BaselineAgent(config=config, force_offline=True)
+    advanced_stress = AdvancedAgent(config=config, force_offline=True)
+
+    stress_rows = [
+        run_agent_benchmark("Baseline", baseline_stress, stress_convs, config),
+        run_agent_benchmark("Advanced", advanced_stress, stress_convs, config),
+    ]
+
+    print("=== Standard Benchmark (data/conversations.json) ===")
+    print(format_rows(standard_rows))
+    print()
+    print("=== Long-Context Stress Benchmark (data/advanced_long_context.json) ===")
+    print(format_rows(stress_rows))
 
 
 if __name__ == "__main__":
